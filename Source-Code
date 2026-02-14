@@ -1,0 +1,240 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+/* ================= OLED ================= */
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+/* ================= WIFI ================= */
+const char* ssid = "Yourssid";
+const char* password = "password";
+
+/* ================= EMAIL API ================= */
+const char* host = "www.circuitdigest.cloud";
+const int httpsPort = 443;
+const char* apiKey = "yourapikey";
+
+/* ================= BUTTONS ================= */
+#define BTN_CAPTURE 12
+#define BTN_SEND    15
+
+/* ================= ESP32-CAM AI THINKER ================= */
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+/* ================= GLOBALS ================= */
+camera_fb_t* storedFb = NULL;
+bool imageAvailable = false;
+bool lastCaptureState = HIGH;
+bool lastSendState = HIGH;
+
+/* ================= OLED HELPERS ================= */
+void oledBig(const char* msg) {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 22);
+  display.println(msg);
+  display.display();
+}
+
+void oledFlash() {
+  display.clearDisplay();
+  display.fillRect(0, 0, 128, 64, SSD1306_WHITE);
+  display.display();
+  delay(120);
+  display.clearDisplay();
+  display.display();
+}
+
+void oledLoadingBar() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(30, 10);
+  display.println("Sending...");
+  display.drawRect(10, 40, 108, 10, SSD1306_WHITE);
+  display.display();
+
+  for (int i = 0; i <= 100; i += 10) {
+    display.fillRect(12, 42, i, 6, SSD1306_WHITE);
+    display.display();
+    delay(120);
+  }
+}
+
+/* ================= SETUP ================= */
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin(13, 14);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED FAIL");
+    while (true);
+  }
+
+  oledBig("BOOT");
+
+  pinMode(BTN_CAPTURE, INPUT_PULLUP);
+  pinMode(BTN_SEND, INPUT_PULLUP);
+
+  WiFi.begin(ssid, password);
+  oledBig("WiFi...");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+  }
+  oledBig("WiFi OK");
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size   = FRAMESIZE_VGA;
+  config.jpeg_quality = 12;
+  config.fb_count     = 1;
+
+  if (esp_camera_init(&config) != ESP_OK) {
+    oledBig("CAM ERR");
+    while (true);
+  }
+
+  /* 🔑 I2C RE-INIT AFTER CAMERA (CRITICAL FIX) */
+  Wire.end();
+  delay(50);
+  Wire.begin(13, 14);
+
+  oledBig("READY");
+}
+
+/* ================= LOOP ================= */
+void loop() {
+  bool captureState = digitalRead(BTN_CAPTURE);
+  bool sendState = digitalRead(BTN_SEND);
+
+  if (captureState == LOW && lastCaptureState == HIGH) {
+    captureImage();
+  }
+
+  if (sendState == LOW && lastSendState == HIGH) {
+    if (imageAvailable) {
+      sendEmailWithImage();
+    } else {
+      oledBig("NO IMG");
+    }
+  }
+
+  lastCaptureState = captureState;
+  lastSendState = sendState;
+  delay(50);
+}
+
+/* ================= FUNCTIONS ================= */
+
+void captureImage() {
+  if (storedFb) {
+    esp_camera_fb_return(storedFb);
+    storedFb = NULL;
+  }
+
+  oledBig("CAP 📸");
+  oledFlash();  // BEFORE capture
+
+  storedFb = esp_camera_fb_get();
+  if (!storedFb) {
+    oledBig("FAIL");
+    imageAvailable = false;
+    return;
+  }
+
+  imageAvailable = true;
+  oledBig("DONE");
+}
+
+bool sendEmailWithImage() {
+  oledLoadingBar();   // BEFORE network stress
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  if (!client.connect(host, httpsPort)) {
+    oledBig("NET ERR");
+    return false;
+  }
+
+  String boundary = "----ESP32CAMBoundary";
+
+  String bodyStart =
+    "--" + boundary + "\r\n"
+    "Content-Disposition: form-data; name=\"to_email\"\r\n\r\n"
+    "your register mailid\r\n"
+    "--" + boundary + "\r\n"
+    "Content-Disposition: form-data; name=\"template_id\"\r\n\r\n"
+    "1002\r\n"
+    "--" + boundary + "\r\n"
+    "Content-Disposition: form-data; name=\"variables\"\r\n\r\n"
+    "{\"title\":\"ESP32-CAM Alert\",\"description\":\"Image captured\"}\r\n"
+    "--" + boundary + "\r\n"
+    "Content-Disposition: form-data; name=\"image\"; filename=\"image.jpg\"\r\n"
+    "Content-Type: image/jpeg\r\n\r\n";
+
+  String bodyEnd = "\r\n--" + boundary + "--\r\n";
+
+  int contentLength = bodyStart.length() + storedFb->len + bodyEnd.length();
+
+  client.println("POST /api/v1/email/send-with-image HTTP/1.1");
+  client.println("Host: " + String(host));
+  client.println("Authorization: Bearer " + String(apiKey));
+  client.println("Content-Type: multipart/form-data; boundary=" + boundary);
+  client.print("Content-Length: ");
+  client.println(contentLength);
+  client.println();
+
+  client.print(bodyStart);
+  client.write(storedFb->buf, storedFb->len);
+  client.print(bodyEnd);
+
+  delay(1000);
+  client.stop();
+
+  esp_camera_fb_return(storedFb);
+  storedFb = NULL;
+  imageAvailable = false;
+
+  oledBig("SENT");
+  return true;
+}
